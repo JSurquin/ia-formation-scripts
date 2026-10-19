@@ -23,8 +23,8 @@ Variables : N8N_PORT, N8N_CONTAINER, MAKE_URL, ZAPIER_URL
 Recommandé (depuis un clone du dépôt formation) :
   bash scripts/setup-automation-lab.sh
 
-Une ligne curl (Linux / macOS) — seulement si le dépôt GitHub est public :
-  curl -fsSL https://raw.githubusercontent.com/JSurquin/ia-formation/main/scripts/setup-automation-lab.sh | bash
+Une ligne curl (Linux / macOS) — dépôt public ia-formation-scripts :
+  curl -fsSL https://raw.githubusercontent.com/JSurquin/ia-formation-scripts/main/setup-automation-lab.sh | bash
 
 Make et Zapier ne s'installent pas en local : le script ouvre les pages d'inscription.
 n8n tourne sur http://127.0.0.1:5678 après le premier lancement réussi.
