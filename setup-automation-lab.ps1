@@ -5,19 +5,42 @@
 .DESCRIPTION
   Make et Zapier ne s'installent pas en local : le script ouvre les pages d'inscription.
   n8n écoute sur http://127.0.0.1:5678 après un lancement réussi.
+  Installe cloudflared si absent (tunnel : cloudflared tunnel --url http://127.0.0.1:5678).
 
-  .\scripts\setup-automation-lab.ps1 [-NoBrowser] [-SkipN8n]
+  .\scripts\setup-automation-lab.ps1 [-NoBrowser] [-SkipN8n] [-SkipCloudflared]
 #>
 
 $ErrorActionPreference = "Stop"
 $NoBrowser = $false
 $SkipN8n = $false
+$SkipCloudflared = $false
 for ($i = 0; $i -lt $args.Count; $i++) {
   switch -Regex ($args[$i]) {
     "^-NoBrowser$" { $NoBrowser = $true }
     "^-SkipN8n$" { $SkipN8n = $true }
+    "^-SkipCloudflared$" { $SkipCloudflared = $true }
+    "^-Help$" { $ShowHelp = $true }
   }
 }
+
+if ($ShowHelp) {
+  @"
+Usage: .\scripts\setup-automation-lab.ps1 [-NoBrowser] [-SkipN8n] [-SkipCloudflared]
+
+  -NoBrowser        N'ouvre pas make.com / zapier.com
+  -SkipN8n          Liens cloud uniquement (pas de conteneur n8n)
+  -SkipCloudflared  N'installe pas cloudflared
+
+Une ligne (dépôt public ia-formation-scripts) :
+  irm https://raw.githubusercontent.com/JSurquin/ia-formation-scripts/main/setup-automation-lab.ps1 | iex
+
+Dépôt Windows dédié (partage élèves) :
+  irm https://raw.githubusercontent.com/JSurquin/ia-formation-automation-lab-windows/main/setup-automation-lab.ps1 | iex
+"@ | Write-Host
+  exit 0
+}
+
+if ($env:SKIP_CLOUDFLARED -eq "1") { $SkipCloudflared = $true }
 
 $N8nPort = if ($env:N8N_PORT) { $env:N8N_PORT } else { "5678" }
 $N8nContainer = if ($env:N8N_CONTAINER) { $env:N8N_CONTAINER } else { "formation-n8n" }
@@ -43,80 +66,235 @@ function Update-SessionPath {
   $env:Path = "$machine;$user"
   $extra = @(
     "$env:ProgramFiles\Docker\Docker\resources\bin",
-    "$env:ProgramFiles\Git\cmd"
+    "$env:ProgramFiles\Git\cmd",
+    "$env:ProgramFiles\cloudflared",
+    "$env:LocalAppData\Microsoft\WinGet\Links"
   )
   foreach ($p in $extra) {
     if ((Test-Path $p) -and ($env:Path -notlike "*$p*")) { $env:Path = "$p;$env:Path" }
   }
 }
 
+function Install-WingetPackage([string]$Id) {
+  if (-not (Test-Command "winget")) {
+    Fail "winget est introuvable. Ouvrez le Microsoft Store, installez « Programme d'installation d'application », puis relancez."
+  }
+  Write-Step "winget install $Id"
+  & winget install --id $Id -e --accept-package-agreements --accept-source-agreements
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne -1978335189) {
+    Write-Warn "winget a renvoyé le code $LASTEXITCODE pour $Id (souvent déjà installé). On continue."
+  }
+  Update-SessionPath
+}
+
 function Test-DockerReady {
   try {
     & docker info 2>$null | Out-Null
-    return $true
+    return ($LASTEXITCODE -eq 0)
   } catch {
     return $false
   }
 }
 
-function Wait-Docker {
-  Write-Step "Attente de Docker Desktop (jusqu'à 3 minutes)…"
+function Test-PodmanReady {
+  if (-not (Test-Command "podman")) { return $false }
+  try {
+    & podman info 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+  } catch {
+    return $false
+  }
+}
+
+function Get-ContainerEngine {
+  if (Test-DockerReady) { return "docker" }
+  if (Test-PodmanReady) { return "podman" }
+  return $null
+}
+
+function Invoke-Container([string[]]$ContainerArgs) {
+  $engine = Get-ContainerEngine
+  if (-not $engine) { Fail "Docker / Podman ne répond pas." }
+  if ($engine -eq "podman") {
+    & podman @ContainerArgs
+  } else {
+    & docker @ContainerArgs
+  }
+  if ($LASTEXITCODE -ne 0) { Fail "Commande $engine échouée : $($ContainerArgs -join ' ')" }
+}
+
+function Get-ContainerNameList([switch]$All) {
+  $engine = Get-ContainerEngine
+  if (-not $engine) { return @() }
+  $psArgs = if ($All) { @("ps", "-a", "--format", "{{.Names}}") } else { @("ps", "--format", "{{.Names}}") }
+  if ($engine -eq "podman") {
+    return @(podman @psArgs 2>$null)
+  }
+  return @(docker @psArgs 2>$null)
+}
+
+function Wait-ContainerEngine {
+  Write-Step "Attente du moteur conteneurs (jusqu'à 3 minutes)…"
   for ($i = 0; $i -lt 60; $i++) {
-    if (Test-DockerReady) {
-      Write-Ok "Docker prêt"
-      return
+    Update-SessionPath
+    $engine = Get-ContainerEngine
+    if ($engine) {
+      if ($engine -eq "podman") {
+        Write-Ok ("Podman prêt — " + (podman --version))
+      } else {
+        Write-Ok ("Docker prêt — " + (docker --version))
+      }
+      return $true
     }
     Start-Sleep -Seconds 3
   }
-  Fail "Docker ne répond pas. Ouvrez Docker Desktop, attendez qu'il soit vert, relancez."
+  return $false
+}
+
+function Test-PendingReboot {
+  $paths = @(
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+  )
+  foreach ($p in $paths) {
+    if (Test-Path $p) { return $true }
+  }
+  return $false
+}
+
+function Ensure-Wsl {
+  try {
+    wsl --status 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+      Write-Ok "WSL déjà disponible"
+      return
+    }
+  } catch { }
+
+  Write-Step "Installation de WSL 2 (requis pour Docker Desktop)"
+  Write-Warn "Compte administrateur possible, puis redémarrage Windows."
+  try {
+    wsl --install --no-distribution
+  } catch {
+    Write-Warn "wsl --install a échoué. PowerShell en administrateur : wsl --install"
+  }
+  if (Test-PendingReboot) {
+    Fail "Redémarrage requis (WSL). Redémarrez le PC, puis relancez la même commande."
+  }
+}
+
+function Start-DockerDesktop {
+  $candidates = @(
+    "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe",
+    "$env:LocalAppData\Programs\Docker\Docker\Docker Desktop.exe"
+  )
+  foreach ($exe in $candidates) {
+    if (Test-Path $exe) {
+      Start-Process $exe -ErrorAction SilentlyContinue | Out-Null
+      return $true
+    }
+  }
+  return $false
+}
+
+function Start-PodmanMachine {
+  if (-not (Test-Command "podman")) { return $false }
+  Write-Step "Podman détecté — démarrage de la machine"
+  & podman machine start 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    & podman machine init --now 2>$null
+  }
+  return (Wait-ContainerEngine)
 }
 
 function Ensure-Docker {
   Update-SessionPath
-  if (Test-DockerReady) {
-    Write-Ok "Docker déjà opérationnel"
+  if (Get-ContainerEngine) {
+    Write-Ok "Moteur conteneurs déjà opérationnel"
     return
   }
-  if (Test-Path "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe") {
-    Write-Step "Ouverture de Docker Desktop"
-    Start-Process "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe" -ErrorAction SilentlyContinue
-    Wait-Docker
+
+  if (Test-Command "podman") {
+    if (Start-PodmanMachine) { return }
+  }
+
+  Ensure-Wsl
+
+  if (-not (Test-Command "docker")) {
+    if (Test-Path "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe") {
+      Write-Ok "Docker Desktop installé (binaire présent)"
+    } else {
+      Write-Step "Installation de Docker Desktop (winget)"
+      Install-WingetPackage "Docker.DockerDesktop"
+      Update-SessionPath
+    }
+  }
+
+  Write-Step "Lancement de Docker Desktop"
+  Start-DockerDesktop | Out-Null
+  Write-Warn "Acceptez les droits au premier lancement si Windows le demande."
+
+  if (Test-PendingReboot) {
+    Fail "Redémarrage requis après Docker / WSL. Redémarrez, puis relancez ce script."
+  }
+
+  if (-not (Wait-ContainerEngine)) {
+    Fail "Docker ne répond pas. Ouvrez Docker Desktop, attendez la baleine verte, relancez."
+  }
+}
+
+function Ensure-Cloudflared {
+  if ($SkipCloudflared) {
+    Write-Warn "cloudflared ignoré (-SkipCloudflared)"
     return
   }
-  if (Test-Command "winget") {
-    Write-Step "Installation de Docker Desktop (winget)"
-    & winget install --id Docker.DockerDesktop -e --accept-package-agreements --accept-source-agreements
-    Update-SessionPath
-    Start-Process "${env:ProgramFiles}\Docker\Docker\Docker Desktop.exe" -ErrorAction SilentlyContinue
-    Write-Warn "Acceptez l'installation au premier lancement, puis relancez ce script si besoin."
-    Wait-Docker
+  Update-SessionPath
+  if (Test-Command "cloudflared") {
+    Write-Ok ("cloudflared déjà installé — " + (cloudflared --version 2>$null))
     return
   }
-  Fail "Installez Docker Desktop, puis relancez scripts/setup-automation-lab.ps1"
+  Write-Step "Installation de cloudflared (winget)"
+  Install-WingetPackage "Cloudflare.cloudflared"
+  Update-SessionPath
+  if (-not (Test-Command "cloudflared")) {
+    Write-Warn "cloudflared introuvable après winget. Téléchargement : https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/"
+    return
+  }
+  Write-Ok ("cloudflared installé — " + (cloudflared --version 2>$null))
+}
+
+function Show-TunnelHint {
+  if ($SkipCloudflared -or -not (Test-Command "cloudflared")) { return }
+  Write-Step "Tunnel Cloudflare (webhooks n8n depuis Internet)"
+  Write-Host "  Exemple rapide (URL temporaire) :"
+  Write-Host "    cloudflared tunnel --url http://127.0.0.1:${N8nPort}"
+  Write-Host "  Copiez l'URL https://*.trycloudflare.com affichée dans le terminal."
 }
 
 function Start-N8nLab {
   Ensure-Docker
-  $running = docker ps --format "{{.Names}}" 2>$null | Select-String -Pattern "^$([regex]::Escape($N8nContainer))$" -Quiet
+  $running = Get-ContainerNameList | Select-String -Pattern "^$([regex]::Escape($N8nContainer))$" -Quiet
   if ($running) {
     Write-Ok "Conteneur n8n déjà actif ($N8nContainer)"
     return
   }
-  $exists = docker ps -a --format "{{.Names}}" 2>$null | Select-String -Pattern "^$([regex]::Escape($N8nContainer))$" -Quiet
+  $exists = Get-ContainerNameList -All | Select-String -Pattern "^$([regex]::Escape($N8nContainer))$" -Quiet
   if ($exists) {
     Write-Step "Redémarrage de n8n"
-    docker start $N8nContainer | Out-Null
+    Invoke-Container @("start", $N8nContainer) | Out-Null
   } else {
     Write-Step "Premier lancement de n8n"
-    docker volume create $N8nVolume | Out-Null
-    docker run -d `
-      --name $N8nContainer `
-      --restart unless-stopped `
-      -p "127.0.0.1:${N8nPort}:5678" `
-      -e GENERIC_TIMEZONE=Europe/Paris `
-      -e TZ=Europe/Paris `
-      -v "${N8nVolume}:/home/node/.n8n" `
-      docker.n8n.io/n8nio/n8n | Out-Null
+    Invoke-Container @("volume", "create", $N8nVolume) | Out-Null
+    Invoke-Container @(
+      "run", "-d",
+      "--name", $N8nContainer,
+      "--restart", "unless-stopped",
+      "-p", "127.0.0.1:${N8nPort}:5678",
+      "-e", "GENERIC_TIMEZONE=Europe/Paris",
+      "-e", "TZ=Europe/Paris",
+      "-v", "${N8nVolume}:/home/node/.n8n",
+      "docker.n8n.io/n8nio/n8n"
+    ) | Out-Null
   }
   for ($i = 0; $i -lt 30; $i++) {
     try {
@@ -149,11 +327,13 @@ function Show-CloudLinks {
 Write-Step "Lab automatisation — formation assistants IA (2026)"
 if (-not $SkipN8n) {
   Start-N8nLab
+  Ensure-Cloudflared
+  Show-TunnelHint
 } else {
   Write-Warn "Mode -SkipN8n : pas de conteneur Docker"
 }
 Show-CloudLinks
 Write-Host ""
 Write-Ok "Prêt pour le module 7 (Make / Zapier / n8n)."
-Write-Host "    Arrêter n8n : docker stop $N8nContainer"
+Write-Host "    Arrêter n8n : docker stop $N8nContainer  (ou podman stop si Podman)"
 Write-Host "    Relancer    : .\scripts\setup-automation-lab.ps1"
